@@ -1,0 +1,1008 @@
+<?php
+/**
+ * Plugin Name: Custom Shortcodes Manager
+ * Description: Gestiona shortcodes personalizados y variables personalizadas con compatibilidad completa para emails
+ * Version: 1.3.0
+ * Author: Tu Nombre
+ * Text Domain: custom-shortcodes
+ */
+
+// Evitar acceso directo
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+// Definir constantes
+define('CSM_PLUGIN_URL', plugin_dir_url(__FILE__));
+define('CSM_PLUGIN_PATH', plugin_dir_path(__FILE__));
+define('CSM_VERSION', '1.3.0');
+
+// Clase principal del plugin
+class CustomShortcodesManager {
+    
+    private $shortcodes_option = 'csm_custom_shortcodes';
+    private $cf7_integration_option = 'csm_cf7_integration';
+    
+    public function __construct() {
+        add_action('init', array($this, 'init'));
+        register_activation_hook(__FILE__, array($this, 'activate'));
+        register_deactivation_hook(__FILE__, array($this, 'deactivate'));
+    }
+    
+    public function init() {
+        // Cargar traducciones
+        load_plugin_textdomain('custom-shortcodes', false, dirname(plugin_basename(__FILE__)) . '/languages');
+        
+        // Inicializar funcionalidades
+        $this->register_shortcodes();
+        
+        // Integraciones con plugins de formularios
+        $this->init_form_integrations();
+        
+        // Solo en admin
+        if (is_admin()) {
+            $this->admin_init();
+        }
+    }
+    
+    public function activate() {
+        // Configuración por defecto
+        $default_shortcodes = array(
+            array(
+                'name' => 'boton',
+                'content' => '<a href="{url}" class="btn {clase}" style="background-color:{color}; color:white; padding:10px 20px; text-decoration:none; display:inline-block; border-radius:4px; font-family:Arial, sans-serif;">{texto}</a>',
+                'description' => 'Botón personalizable para emails',
+                'created' => current_time('mysql')
+            ),
+            array(
+                'name' => 'panel',
+                'content' => '<div class="panel {tipo}" style="border:1px solid #ddd; padding:15px; margin:10px 0; background-color:#f9f9f9; font-family:Arial, sans-serif;"><h3 style="margin-top:0; color:#333;">{titulo}</h3><div class="panel-content">{{content}}</div></div>',
+                'description' => 'Panel con contenido para emails',
+                'created' => current_time('mysql')
+            ),
+            array(
+                'name' => 'firma_email',
+                'content' => '<div style="border-top:1px solid #ccc; padding-top:15px; margin-top:20px; color:#666; font-size:12px; font-family:Arial, sans-serif;">Saludos,<br><strong>{nombre}</strong><br>{cargo}<br>{empresa}</div>',
+                'description' => 'Firma para emails',
+                'created' => current_time('mysql')
+            ),
+            array(
+                'name' => 'destacado',
+                'content' => '<div style="background-color:#fff3cd; border:1px solid #ffeaa7; padding:15px; margin:10px 0; border-radius:4px; font-family:Arial, sans-serif;">{{content}}</div>',
+                'description' => 'Texto destacado para emails',
+                'created' => current_time('mysql')
+            )
+        );
+        
+        add_option($this->shortcodes_option, $default_shortcodes);
+        
+        // Configuración por defecto para integraciones
+        $default_integration = array(
+            'cf7_enabled' => true,
+            'process_in_emails' => true,
+            'process_cf7_mail_2' => true,
+            'allowed_shortcodes' => array('boton', 'panel', 'firma_email', 'destacado', 'fecha_actual', 'nombre_sitio', 'url_sitio')
+        );
+        
+        add_option($this->cf7_integration_option, $default_integration);
+        
+        flush_rewrite_rules();
+    }
+    
+    public function deactivate() {
+        flush_rewrite_rules();
+    }
+    
+    private function register_shortcodes() {
+        $saved_shortcodes = get_option($this->shortcodes_option, array());
+        
+        foreach ($saved_shortcodes as $shortcode) {
+            if (!empty($shortcode['name'])) {
+                add_shortcode($shortcode['name'], function($atts, $content = null) use ($shortcode) {
+                    return $this->render_shortcode($shortcode, $atts, $content);
+                });
+            }
+        }
+        
+        // Shortcodes para custom fields
+        add_shortcode('campo_personalizado', array($this, 'render_custom_field'));
+        add_shortcode('meta', array($this, 'render_custom_field'));
+        add_shortcode('lista_campos', array($this, 'render_custom_fields_list'));
+        
+        // Shortcodes especiales para emails
+        add_shortcode('fecha_actual', array($this, 'render_current_date'));
+        add_shortcode('nombre_sitio', array($this, 'render_site_name'));
+        add_shortcode('url_sitio', array($this, 'render_site_url'));
+        add_shortcode('ano_actual', array($this, 'render_current_year'));
+    }
+    
+    private function init_form_integrations() {
+        $integration_settings = get_option($this->cf7_integration_option, array());
+        
+        if ($integration_settings['cf7_enabled']) {
+            // Integración CORREGIDA con Contact Form 7
+            // Usamos una prioridad más baja para ejecutarnos después de que CF7 procese sus tags
+            add_filter('wpcf7_mail_components', array($this, 'process_cf7_email_shortcodes'), 20, 3);
+            
+            // Procesar shortcodes en los campos de CF7 (para los formularios)
+            add_filter('wpcf7_form_elements', 'do_shortcode');
+            
+            // Asegurarnos de que los shortcodes se procesen en el contenido del formulario
+            add_filter('wpcf7_contact_form_properties', array($this, 'process_cf7_form_properties'), 10, 2);
+        }
+        
+        if ($integration_settings['process_in_emails']) {
+            // Integración con otros formularios (genérico)
+            add_filter('wp_mail', array($this, 'process_generic_email_shortcodes'));
+        }
+    }
+    
+    /**
+     * Procesar shortcodes en las propiedades del formulario CF7
+     */
+    public function process_cf7_form_properties($properties, $form) {
+        foreach ($properties as $key => $value) {
+            if (is_string($value)) {
+                $properties[$key] = do_shortcode($value);
+            }
+        }
+        return $properties;
+    }
+    
+    /**
+     * CORREGIDO: Procesar shortcodes en los emails de CF7
+     * Esta función se ejecuta después de que CF7 procese sus propios tags
+     */
+    public function process_cf7_email_shortcodes($components, $wpcf7, $mail = null) {
+        $integration_settings = get_option($this->cf7_integration_option, array());
+        
+        // Verificar si estamos en Mail (1) o Mail (2) y si está habilitado
+        $is_mail_2 = ($mail && isset($mail->name()) && $mail->name() == 'mail_2');
+        
+        if ($is_mail_2 && !$integration_settings['process_cf7_mail_2']) {
+            return $components; // No procesar si Mail 2 está deshabilitado
+        }
+        
+        // Procesar shortcodes en el asunto
+        if (isset($components['subject'])) {
+            $components['subject'] = $this->process_email_shortcodes($components['subject'], $wpcf7);
+        }
+        
+        // Procesar shortcodes en el cuerpo
+        if (isset($components['body'])) {
+            $components['body'] = $this->process_email_shortcodes($components['body'], $wpcf7);
+        }
+        
+        // Procesar shortcodes en los headers
+        if (isset($components['additional_headers'])) {
+            $components['additional_headers'] = $this->process_email_shortcodes($components['additional_headers'], $wpcf7);
+        }
+        
+        return $components;
+    }
+    
+    /**
+     * Procesar shortcodes en emails genéricos
+     */
+    public function process_generic_email_shortcodes($args) {
+        // Procesar shortcodes en emails genéricos de WordPress
+        if (isset($args['subject'])) {
+            $args['subject'] = $this->process_email_shortcodes($args['subject']);
+        }
+        
+        if (isset($args['message'])) {
+            $args['message'] = $this->process_email_shortcodes($args['message']);
+        }
+        
+        if (isset($args['headers'])) {
+            $args['headers'] = $this->process_email_shortcodes($args['headers']);
+        }
+        
+        return $args;
+    }
+    
+    /**
+     * Función mejorada para procesar shortcodes en emails
+     */
+    private function process_email_shortcodes($content, $wpcf7_form = null) {
+        // Si es un formulario CF7, obtener los datos enviados
+        $submission = null;
+        if ($wpcf7_form && class_exists('WPCF7_Submission')) {
+            $submission = WPCF7_Submission::get_instance();
+        }
+        
+        // Reemplazar placeholders de CF7 con valores reales primero
+        if ($submission && $posted_data = $submission->get_posted_data()) {
+            foreach ($posted_data as $key => $value) {
+                if (is_array($value)) {
+                    $value = implode(', ', $value);
+                }
+                $placeholder = '[' . $key . ']';
+                $content = str_replace($placeholder, $value, $content);
+            }
+        }
+        
+        // Procesar shortcodes de WordPress (incluyendo los nuestros)
+        $content = do_shortcode($content);
+        
+        return $content;
+    }
+    
+    private function render_shortcode($shortcode_data, $atts, $content) {
+        $attributes = shortcode_atts(array(
+            'class' => '',
+            'id' => '',
+            'style' => ''
+        ), $atts);
+        
+        $output = $shortcode_data['content'];
+        
+        // Reemplazar contenido
+        if ($content) {
+            $output = str_replace('{{content}}', $content, $output);
+        }
+        
+        // Reemplazar atributos
+        foreach ($atts as $key => $value) {
+            $output = str_replace("{{$key}}", $value, $output);
+        }
+        
+        // Aplicar do_shortcode para permitir shortcodes anidados
+        $output = do_shortcode($output);
+        
+        return $output;
+    }
+    
+    // Shortcodes especiales para emails
+    public function render_current_date($atts) {
+        $atts = shortcode_atts(array(
+            'format' => get_option('date_format'),
+            'time' => 'current'
+        ), $atts);
+        
+        if ($atts['time'] === 'current') {
+            $time = current_time('timestamp');
+        } else {
+            $time = strtotime($atts['time']);
+        }
+        
+        return date_i18n($atts['format'], $time);
+    }
+    
+    public function render_current_year($atts) {
+        return date('Y');
+    }
+    
+    public function render_site_name($atts) {
+        return get_bloginfo('name');
+    }
+    
+    public function render_site_url($atts) {
+        return get_site_url();
+    }
+    
+    public function render_custom_field($atts) {
+        $atts = shortcode_atts(array(
+            'key' => '',
+            'post_id' => get_the_ID(),
+            'default' => '',
+            'format' => 'raw'
+        ), $atts);
+        
+        if (empty($atts['key'])) {
+            return $atts['default'];
+        }
+        
+        $value = get_post_meta($atts['post_id'], $atts['key'], true);
+        
+        if (empty($value)) {
+            return $atts['default'];
+        }
+        
+        // Formatear salida
+        switch ($atts['format']) {
+            case 'url':
+                return esc_url($value);
+            case 'email':
+                return sanitize_email($value);
+            case 'number':
+                return intval($value);
+            case 'date':
+                return date_i18n(get_option('date_format'), strtotime($value));
+            default:
+                return sanitize_text_field($value);
+        }
+    }
+    
+    public function render_custom_fields_list($atts) {
+        $atts = shortcode_atts(array(
+            'post_id' => get_the_ID(),
+            'exclude' => '_edit_lock,_edit_last,_wp_page_template',
+            'show_empty' => 'no',
+            'class' => 'custom-fields-list'
+        ), $atts);
+        
+        $custom_fields = get_post_meta($atts['post_id']);
+        $exclude_fields = explode(',', $atts['exclude']);
+        
+        if (empty($custom_fields)) {
+            return '<p>' . __('No hay campos personalizados', 'custom-shortcodes') . '</p>';
+        }
+        
+        $output = '<div class="' . esc_attr($atts['class']) . '">';
+        
+        foreach ($custom_fields as $key => $values) {
+            if (in_array($key, $exclude_fields)) {
+                continue;
+            }
+            
+            foreach ($values as $value) {
+                if (empty($value) && $atts['show_empty'] === 'no') {
+                    continue;
+                }
+                
+                $output .= sprintf(
+                    '<div class="custom-field-item"><span class="field-key">%s:</span> <span class="field-value">%s</span></div>',
+                    esc_html($key),
+                    esc_html($value)
+                );
+            }
+        }
+        
+        $output .= '</div>';
+        
+        return $output;
+    }
+    
+    private function admin_init() {
+        add_action('admin_menu', array($this, 'add_admin_menu'));
+        add_action('admin_init', array($this, 'register_settings'));
+        add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_scripts'));
+    }
+    
+    public function enqueue_admin_scripts($hook) {
+        if (strpos($hook, 'custom-shortcodes') === false) {
+            return;
+        }
+        
+        wp_enqueue_style('csm-admin-style', CSM_PLUGIN_URL . 'assets/admin-style.css', array(), CSM_VERSION);
+        wp_enqueue_script('csm-admin-script', CSM_PLUGIN_URL . 'assets/admin-script.js', array('jquery'), CSM_VERSION, true);
+        
+        wp_localize_script('csm-admin-script', 'csm_ajax', array(
+            'nonce' => wp_create_nonce('csm_ajax_nonce'),
+            'confirm_delete' => __('¿Estás seguro de que quieres eliminar este shortcode?', 'custom-shortcodes')
+        ));
+    }
+    
+    public function add_admin_menu() {
+        add_menu_page(
+            __('Shortcodes Personalizados', 'custom-shortcodes'),
+            __('Shortcodes', 'custom-shortcodes'),
+            'manage_options',
+            'custom-shortcodes',
+            array($this, 'admin_main_page'),
+            'dashicons-shortcode',
+            100
+        );
+        
+        add_submenu_page(
+            'custom-shortcodes',
+            __('Añadir Nuevo Shortcode', 'custom-shortcodes'),
+            __('Añadir Nuevo', 'custom-shortcodes'),
+            'manage_options',
+            'add-custom-shortcode',
+            array($this, 'add_shortcode_page')
+        );
+        
+        add_submenu_page(
+            'custom-shortcodes',
+            __('Configuración de Emails', 'custom-shortcodes'),
+            __('Configuración Emails', 'custom-shortcodes'),
+            'manage_options',
+            'shortcodes-email-settings',
+            array($this, 'email_settings_page')
+        );
+        
+        add_submenu_page(
+            'custom-shortcodes',
+            __('Documentación', 'custom-shortcodes'),
+            __('Documentación', 'custom-shortcodes'),
+            'manage_options',
+            'shortcodes-documentation',
+            array($this, 'documentation_page')
+        );
+    }
+    
+    public function register_settings() {
+        register_setting('csm_settings', $this->shortcodes_option);
+        register_setting('csm_email_settings', $this->cf7_integration_option);
+    }
+    
+    public function admin_main_page() {
+        ?>
+        <div class="wrap">
+            <h1><?php _e('Shortcodes Personalizados', 'custom-shortcodes'); ?></h1>
+            
+            <?php
+            // Manejar eliminación de shortcodes
+            if (isset($_GET['delete_shortcode']) && check_admin_referer('delete_shortcode')) {
+                $this->delete_shortcode(sanitize_text_field($_GET['delete_shortcode']));
+                echo '<div class="notice notice-success"><p>' . __('Shortcode eliminado correctamente', 'custom-shortcodes') . '</p></div>';
+            }
+            
+            $this->list_shortcodes();
+            ?>
+        </div>
+        <?php
+    }
+    
+    public function add_shortcode_page() {
+        $editing = false;
+        $shortcode_data = array(
+            'name' => '',
+            'content' => '',
+            'description' => ''
+        );
+        
+        // Comprobar si estamos editando un shortcode existente
+        if (isset($_GET['edit']) && !empty($_GET['edit'])) {
+            $editing = true;
+            $shortcode_name = sanitize_text_field($_GET['edit']);
+            $shortcodes = get_option($this->shortcodes_option, array());
+            
+            foreach ($shortcodes as $shortcode) {
+                if ($shortcode['name'] === $shortcode_name) {
+                    $shortcode_data = $shortcode;
+                    break;
+                }
+            }
+            
+            // Si no encontramos el shortcode, mostrar error
+            if (empty($shortcode_data['name'])) {
+                echo '<div class="notice notice-error"><p>' . __('Shortcode no encontrado', 'custom-shortcodes') . '</p></div>';
+                $editing = false;
+            }
+        }
+        ?>
+        <div class="wrap">
+            <h1><?php echo $editing ? __('Editar Shortcode', 'custom-shortcodes') : __('Añadir Nuevo Shortcode', 'custom-shortcodes'); ?></h1>
+            
+            <?php
+            if (isset($_POST['submit_shortcode'])) {
+                $this->handle_shortcode_submission($editing, $shortcode_data['name']);
+            }
+            
+            // Mostrar mensajes de éxito/error después del envío
+            if (isset($_GET['success'])) {
+                $message = $_GET['success'] == '1' ? 
+                    __('Shortcode guardado correctamente', 'custom-shortcodes') : 
+                    __('Error al guardar el shortcode', 'custom-shortcodes');
+                $class = $_GET['success'] == '1' ? 'notice-success' : 'notice-error';
+                echo '<div class="notice ' . $class . '"><p>' . $message . '</p></div>';
+            }
+            ?>
+            
+            <form method="post">
+                <?php wp_nonce_field('csm_new_shortcode', 'csm_nonce'); ?>
+                
+                <?php if ($editing): ?>
+                    <input type="hidden" name="editing" value="1">
+                    <input type="hidden" name="original_name" value="<?php echo esc_attr($shortcode_data['name']); ?>">
+                <?php endif; ?>
+                
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">
+                            <label for="shortcode_name"><?php _e('Nombre del Shortcode', 'custom-shortcodes'); ?></label>
+                        </th>
+                        <td>
+                            <input type="text" name="shortcode_name" id="shortcode_name" 
+                                   class="regular-text" 
+                                   value="<?php echo esc_attr($shortcode_data['name']); ?>"
+                                   <?php echo $editing ? 'readonly' : 'required'; ?>>
+                            <?php if ($editing): ?>
+                                <p class="description"><?php _e('No puedes cambiar el nombre del shortcode al editar. Crea uno nuevo si necesitas otro nombre.', 'custom-shortcodes'); ?></p>
+                            <?php else: ?>
+                                <p class="description">
+                                    <?php _e('Sin corchetes. Solo letras, números y guiones bajos. Ejemplo: mi_boton', 'custom-shortcodes'); ?>
+                                </p>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    
+                    <tr>
+                        <th scope="row">
+                            <label for="shortcode_content"><?php _e('Contenido', 'custom-shortcodes'); ?></label>
+                        </th>
+                        <td>
+                            <?php
+                            wp_editor(
+                                $shortcode_data['content'], 
+                                'shortcode_content', 
+                                array(
+                                    'textarea_name' => 'shortcode_content',
+                                    'media_buttons' => true,
+                                    'textarea_rows' => 10,
+                                    'teeny' => false
+                                )
+                            );
+                            ?>
+                            <p class="description">
+                                <?php _e('Usa {{content}} para el contenido entre shortcodes.<br>Usa {atributo} para atributos del shortcode.', 'custom-shortcodes'); ?>
+                            </p>
+                        </td>
+                    </tr>
+                    
+                    <tr>
+                        <th scope="row">
+                            <label for="shortcode_description"><?php _e('Descripción', 'custom-shortcodes'); ?></label>
+                        </th>
+                        <td>
+                            <input type="text" name="shortcode_description" 
+                                   id="shortcode_description" 
+                                   class="regular-text"
+                                   value="<?php echo esc_attr($shortcode_data['description']); ?>">
+                            <p class="description"><?php _e('Descripción opcional para identificar el shortcode', 'custom-shortcodes'); ?></p>
+                        </td>
+                    </tr>
+                </table>
+                
+                <?php 
+                submit_button(
+                    $editing ? __('Actualizar Shortcode', 'custom-shortcodes') : __('Guardar Shortcode', 'custom-shortcodes'), 
+                    'primary', 
+                    'submit_shortcode'
+                ); 
+                ?>
+                
+                <a href="<?php echo admin_url('admin.php?page=custom-shortcodes'); ?>" class="button">
+                    <?php _e('Volver a la lista', 'custom-shortcodes'); ?>
+                </a>
+            </form>
+            
+            <?php if (!$editing): ?>
+            <div class="shortcode-examples">
+                <h3><?php _e('Ejemplos de Uso para Emails', 'custom-shortcodes'); ?></h3>
+                
+                <h4><?php _e('Botón en email:', 'custom-shortcodes'); ?></h4>
+                <pre><code>[boton url="https://tusitio.com" texto="Ir al Sitio" color="#0073aa"]</code></pre>
+                
+                <h4><?php _e('Firma de email:', 'custom-shortcodes'); ?></h4>
+                <pre><code>[firma_email nombre="Juan Pérez" cargo="Director" empresa="Mi Empresa"]</code></pre>
+                
+                <h4><?php _e('Texto destacado:', 'custom-shortcodes'); ?></h4>
+                <pre><code>[destacado]Este es un mensaje importante para el cliente[/destacado]</code></pre>
+                
+                <h4><?php _e('Información dinámica:', 'custom-shortcodes'); ?></h4>
+                <pre><code>Fecha: [fecha_actual format="d/m/Y"]
+Año: [ano_actual]
+Sitio: [nombre_sitio]
+URL: [url_sitio]</code></pre>
+            </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+    
+    public function email_settings_page() {
+        $integration_settings = get_option($this->cf7_integration_option, array());
+        $saved_shortcodes = get_option($this->shortcodes_option, array());
+        $shortcode_names = wp_list_pluck($saved_shortcodes, 'name');
+        
+        // Añadir shortcodes especiales
+        $special_shortcodes = array('fecha_actual', 'nombre_sitio', 'url_sitio', 'ano_actual');
+        $all_shortcodes = array_merge($shortcode_names, $special_shortcodes);
+        ?>
+        <div class="wrap">
+            <h1><?php _e('Configuración para Emails', 'custom-shortcodes'); ?></h1>
+            
+            <?php
+            if (isset($_POST['submit_email_settings'])) {
+                $this->handle_email_settings_submission();
+                // Recargar configuración actualizada
+                $integration_settings = get_option($this->cf7_integration_option, array());
+                echo '<div class="notice notice-success"><p>' . __('Configuración guardada correctamente', 'custom-shortcodes') . '</p></div>';
+            }
+            
+            // Verificar si Contact Form 7 está activo
+            if (!class_exists('WPCF7')) {
+                echo '<div class="notice notice-warning"><p>' . 
+                     __('Contact Form 7 no está activo. La integración con CF7 no funcionará hasta que actives el plugin Contact Form 7.', 'custom-shortcodes') . 
+                     '</p></div>';
+            }
+            ?>
+            
+            <form method="post">
+                <?php wp_nonce_field('csm_email_settings', 'csm_email_nonce'); ?>
+                
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">
+                            <label for="cf7_enabled"><?php _e('Integración con Contact Form 7', 'custom-shortcodes'); ?></label>
+                        </th>
+                        <td>
+                            <input type="checkbox" name="cf7_enabled" id="cf7_enabled" value="1" 
+                                   <?php checked($integration_settings['cf7_enabled'], true); ?>>
+                            <label for="cf7_enabled"><?php _e('Activar procesamiento de shortcodes en emails de CF7', 'custom-shortcodes'); ?></label>
+                        </td>
+                    </tr>
+                    
+                    <tr>
+                        <th scope="row">
+                            <label for="process_cf7_mail_2"><?php _e('Procesar en Correo Electrónico (2)', 'custom-shortcodes'); ?></label>
+                        </th>
+                        <td>
+                            <input type="checkbox" name="process_cf7_mail_2" id="process_cf7_mail_2" value="1" 
+                                   <?php checked($integration_settings['process_cf7_mail_2'], true); ?>>
+                            <label for="process_cf7_mail_2"><?php _e('Activar procesamiento en el email de respuesta automática (Mail 2)', 'custom-shortcodes'); ?></label>
+                            <p class="description"><?php _e('Este es el email que se envía al cliente como confirmación.', 'custom-shortcodes'); ?></p>
+                        </td>
+                    </tr>
+                    
+                    <tr>
+                        <th scope="row">
+                            <label for="process_in_emails"><?php _e('Procesar en emails genéricos', 'custom-shortcodes'); ?></label>
+                        </th>
+                        <td>
+                            <input type="checkbox" name="process_in_emails" id="process_in_emails" value="1" 
+                                   <?php checked($integration_settings['process_in_emails'], true); ?>>
+                            <label for="process_in_emails"><?php _e('Activar procesamiento en todos los emails de WordPress', 'custom-shortcodes'); ?></label>
+                        </td>
+                    </tr>
+                    
+                    <tr>
+                        <th scope="row">
+                            <label><?php _e('Shortcodes permitidos en emails', 'custom-shortcodes'); ?></label>
+                        </th>
+                        <td>
+                            <fieldset>
+                                <legend class="screen-reader-text">
+                                    <span><?php _e('Shortcodes permitidos en emails', 'custom-shortcodes'); ?></span>
+                                </legend>
+                                <?php foreach ($all_shortcodes as $name): ?>
+                                <label style="display: block; margin-bottom: 8px;">
+                                    <input type="checkbox" name="allowed_shortcodes[]" value="<?php echo esc_attr($name); ?>"
+                                           <?php checked(in_array($name, $integration_settings['allowed_shortcodes'])); ?>>
+                                    <code>[<?php echo esc_html($name); ?>]</code>
+                                    <?php if (in_array($name, $special_shortcodes)): ?>
+                                        <em style="color: #666;"> - <?php _e('Shortcode especial', 'custom-shortcodes'); ?></em>
+                                    <?php endif; ?>
+                                </label>
+                                <?php endforeach; ?>
+                            </fieldset>
+                            <p class="description">
+                                <?php _e('Selecciona qué shortcodes quieres que se procesen en los emails. Los shortcodes especiales siempre están disponibles.', 'custom-shortcodes'); ?>
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+                
+                <?php submit_button(__('Guardar Configuración', 'custom-shortcodes'), 'primary', 'submit_email_settings'); ?>
+            </form>
+            
+            <div class="email-integration-info">
+                <h3><?php _e('Uso en Contact Form 7 - CONFIGURACIÓN CORRECTA', 'custom-shortcodes'); ?></h3>
+                <p><strong><?php _e('PASOS IMPORTANTES:', 'custom-shortcodes'); ?></strong></p>
+                <ol>
+                    <li><?php _e('Ve a Contact → Contact Forms', 'custom-shortcodes'); ?></li>
+                    <li><?php _e('Edita tu formulario', 'custom-shortcodes'); ?></li>
+                    <li><?php _e('En la pestaña "Mail", incluye tus shortcodes en el asunto o cuerpo del email', 'custom-shortcodes'); ?></li>
+                    <li><?php _e('En la pestaña "Mail (2)", haz lo mismo para el email de confirmación al cliente', 'custom-shortcodes'); ?></li>
+                    <li><?php _e('¡Los shortcodes se procesarán automáticamente!', 'custom-shortcodes'); ?></li>
+                </ol>
+                
+                <h4><?php _e('Ejemplo para el cuerpo del email (Mail):', 'custom-shortcodes'); ?></h4>
+                <pre><code>Has recibido un nuevo mensaje de contacto:
+
+Nombre: [your-name]
+Email: [your-email]
+Mensaje: [your-message]
+
+[destacado]Este mensaje fue enviado el [fecha_actual format="d/m/Y H:i"][/destacado]
+
+[firma_email nombre="Sistema de Notificaciones" cargo="Soporte" empresa="[nombre_sitio]"]
+
+Puedes contactar al cliente respondiendo este email.</code></pre>
+
+                <h4><?php _e('Ejemplo para el email de confirmación (Mail 2):', 'custom-shortcodes'); ?></h4>
+                <pre><code>Hola [your-name],
+
+Gracias por contactarnos. Hemos recibido tu mensaje correctamente.
+
+[destacado]Te responderemos en un plazo máximo de 24 horas.[/destacado]
+
+[boton url="[url_sitio]" texto="Visitar nuestro sitio" color="#0073aa"]
+
+[firma_email nombre="Atención al Cliente" cargo="Equipo de Soporte" empresa="[nombre_sitio]"]
+
+Saludos cordiales.</code></pre>
+
+                <div class="notice notice-info">
+                    <p><strong><?php _e('Nota:', 'custom-shortcodes'); ?></strong> 
+                    <?php _e('Los shortcodes ahora funcionan tanto en el Mail (notificación al admin) como en el Mail 2 (confirmación al cliente). Asegúrate de activar la opción "Procesar en Correo Electrónico (2)" arriba.', 'custom-shortcodes'); ?>
+                    </p>
+                </div>
+            </div>
+        </div>
+        <?php
+    }
+    
+    public function documentation_page() {
+        ?>
+        <div class="wrap">
+            <h1><?php _e('Documentación - Shortcodes Manager', 'custom-shortcodes'); ?></h1>
+            
+            <div class="documentation-content">
+                <h2><?php _e('Shortcodes para Emails - GUÍA COMPLETA', 'custom-shortcodes'); ?></h2>
+                
+                <h3><?php _e('Shortcodes Especiales para Emails:', 'custom-shortcodes'); ?></h3>
+                <ul>
+                    <li><code>[fecha_actual format="d/m/Y"]</code> - <?php _e('Muestra la fecha actual', 'custom-shortcodes'); ?></li>
+                    <li><code>[ano_actual]</code> - <?php _e('Muestra el año actual', 'custom-shortcodes'); ?></li>
+                    <li><code>[nombre_sitio]</code> - <?php _e('Nombre del sitio web', 'custom-shortcodes'); ?></li>
+                    <li><code>[url_sitio]</code> - <?php _e('URL del sitio web', 'custom-shortcodes'); ?></li>
+                    <li><code>[firma_email nombre="Nombre" cargo="Cargo" empresa="Empresa"]</code> - <?php _e('Firma profesional para emails', 'custom-shortcodes'); ?></li>
+                    <li><code>[boton url="URL" texto="Texto" color="#color"]</code> - <?php _e('Botón HTML para emails', 'custom-shortcodes'); ?></li>
+                    <li><code>[destacado]contenido[/destacado]</code> - <?php _e('Área de contenido destacado', 'custom-shortcodes'); ?></li>
+                    <li><code>[panel tipo="info" titulo="Título"]contenido[/panel]</code> - <?php _e('Panel de información', 'custom-shortcodes'); ?></li>
+                </ul>
+                
+                <h3><?php _e('Uso CORRECTO en Contact Form 7:', 'custom-shortcodes'); ?></h3>
+                <p><?php _e('Los shortcodes personalizados ahora funcionan en:', 'custom-shortcodes'); ?></p>
+                <ul>
+                    <li><strong>Mail (1):</strong> <?php _e('Email de notificación al administrador', 'custom-shortcodes'); ?></li>
+                    <li><strong>Mail (2):</strong> <?php _e('Email de confirmación al cliente', 'custom-shortcodes'); ?></li>
+                    <li><strong>Asunto del email</strong></li>
+                    <li><strong>Cuerpo del email</strong></li>
+                    <li><strong>Email de confirmación</strong></li>
+                </ul>
+                
+                <h3><?php _e('Ejemplo Completo para CF7 - Mail (2) al cliente:', 'custom-shortcodes'); ?></h3>
+                <pre><code>Asunto: Confirmación de contacto - [nombre_sitio]
+
+Cuerpo del mensaje:
+
+Hola [your-name],
+
+Gracias por contactar con [nombre_sitio]. Hemos recibido tu mensaje correctamente.
+
+[destacado]
+<strong>Resumen de tu mensaje:</strong>
+Nombre: [your-name]
+Email: [your-email]
+Asunto: [your-subject]
+</destacado>
+
+Nuestro equipo revisará tu solicitud y te responderá en un plazo máximo de 24 horas.
+
+[boton url="[url_sitio]" texto="Seguir navegando" color="#0073aa"]
+
+[firma_email nombre="Equipo de Soporte" cargo="Atención al Cliente" empresa="[nombre_sitio]"]
+
+Este es un email automático, por favor no respondas a este mensaje.
+© [ano_actual] [nombre_sitio]. Todos los derechos reservados.</code></pre>
+                
+                <div class="notice notice-success">
+                    <p><strong><?php _e('¡Importante!', 'custom-shortcodes'); ?></strong> 
+                    <?php _e('Los shortcodes ahora se procesan automáticamente en ambos tipos de email de Contact Form 7. Ya no verás el código del shortcode en el email enviado.', 'custom-shortcodes'); ?>
+                    </p>
+                </div>
+            </div>
+        </div>
+        <?php
+    }
+    
+    private function handle_shortcode_submission($editing = false, $original_name = '') {
+        if (!wp_verify_nonce($_POST['csm_nonce'], 'csm_new_shortcode')) {
+            wp_die('Error de seguridad');
+        }
+        
+        if (!current_user_can('manage_options')) {
+            wp_die('Sin permisos suficientes');
+        }
+        
+        $name = sanitize_text_field($_POST['shortcode_name']);
+        $content = wp_kses_post($_POST['shortcode_content']);
+        $description = sanitize_text_field($_POST['shortcode_description']);
+        
+        // Validar nombre del shortcode
+        if (!$editing && !preg_match('/^[a-zA-Z0-9_]+$/', $name)) {
+            echo '<div class="notice notice-error"><p>' . __('El nombre del shortcode solo puede contener letras, números y guiones bajos.', 'custom-shortcodes') . '</p></div>';
+            return;
+        }
+        
+        if ($editing) {
+            $result = $this->update_shortcode($original_name, $name, $content, $description);
+        } else {
+            $result = $this->save_shortcode($name, $content, $description);
+        }
+        
+        if ($result) {
+            // Redirigir para evitar reenvío del formulario
+            $redirect_url = admin_url('admin.php?page=add-custom-shortcode&edit=' . $name . '&success=1');
+            if (!$editing) {
+                $redirect_url = admin_url('admin.php?page=add-custom-shortcode&success=1');
+            }
+            wp_redirect($redirect_url);
+            exit;
+        } else {
+            wp_redirect(admin_url('admin.php?page=add-custom-shortcode&success=0'));
+            exit;
+        }
+    }
+    
+    private function handle_email_settings_submission() {
+        if (!wp_verify_nonce($_POST['csm_email_nonce'], 'csm_email_settings')) {
+            wp_die('Error de seguridad');
+        }
+        
+        if (!current_user_can('manage_options')) {
+            wp_die('Sin permisos suficientes');
+        }
+        
+        $integration_settings = array(
+            'cf7_enabled' => isset($_POST['cf7_enabled']),
+            'process_in_emails' => isset($_POST['process_in_emails']),
+            'process_cf7_mail_2' => isset($_POST['process_cf7_mail_2']),
+            'allowed_shortcodes' => isset($_POST['allowed_shortcodes']) ? array_map('sanitize_text_field', $_POST['allowed_shortcodes']) : array()
+        );
+        
+        update_option($this->cf7_integration_option, $integration_settings);
+    }
+    
+    private function save_shortcode($name, $content, $description = '') {
+        $shortcodes = get_option($this->shortcodes_option, array());
+        
+        // Verificar si ya existe
+        foreach ($shortcodes as $shortcode) {
+            if ($shortcode['name'] === $name) {
+                return false; // Ya existe
+            }
+        }
+        
+        // Añadir nuevo
+        $shortcodes[] = array(
+            'name' => $name,
+            'content' => $content,
+            'description' => $description,
+            'created' => current_time('mysql'),
+            'updated' => current_time('mysql')
+        );
+        
+        return update_option($this->shortcodes_option, $shortcodes);
+    }
+    
+    private function update_shortcode($original_name, $name, $content, $description = '') {
+        $shortcodes = get_option($this->shortcodes_option, array());
+        
+        foreach ($shortcodes as $index => $shortcode) {
+            if ($shortcode['name'] === $original_name) {
+                $shortcodes[$index] = array(
+                    'name' => $name,
+                    'content' => $content,
+                    'description' => $description,
+                    'created' => $shortcode['created'],
+                    'updated' => current_time('mysql')
+                );
+                return update_option($this->shortcodes_option, $shortcodes);
+            }
+        }
+        
+        return false;
+    }
+    
+    private function delete_shortcode($name) {
+        $shortcodes = get_option($this->shortcodes_option, array());
+        
+        foreach ($shortcodes as $index => $shortcode) {
+            if ($shortcode['name'] === $name) {
+                unset($shortcodes[$index]);
+                break;
+            }
+        }
+        
+        return update_option($this->shortcodes_option, array_values($shortcodes));
+    }
+    
+    private function list_shortcodes() {
+        $shortcodes = get_option($this->shortcodes_option, array());
+        
+        if (empty($shortcodes)) {
+            echo '<p>' . __('No hay shortcodes personalizados creados.', 'custom-shortcodes') . '</p>';
+            echo '<p><a href="' . admin_url('admin.php?page=add-custom-shortcode') . '" class="button button-primary">' . __('Crear tu primer shortcode', 'custom-shortcodes') . '</a></p>';
+            return;
+        }
+        ?>
+        
+        <div class="card">
+            <h2 class="title"><?php _e('Shortcodes Disponibles', 'custom-shortcodes'); ?></h2>
+            <p><?php _e('Usa estos shortcodes en tus posts, páginas y emails.', 'custom-shortcodes'); ?></p>
+        </div>
+        
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th><?php _e('Nombre', 'custom-shortcodes'); ?></th>
+                    <th><?php _e('Shortcode', 'custom-shortcodes'); ?></th>
+                    <th><?php _e('Descripción', 'custom-shortcodes'); ?></th>
+                    <th><?php _e('Fecha', 'custom-shortcodes'); ?></th>
+                    <th><?php _e('Acciones', 'custom-shortcodes'); ?></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($shortcodes as $shortcode): ?>
+                <tr>
+                    <td><strong><?php echo esc_html($shortcode['name']); ?></strong></td>
+                    <td>
+                        <code>[<?php echo esc_html($shortcode['name']); ?>]</code>
+                        <?php if (strpos($shortcode['content'], '{{content}}') !== false): ?>
+                        <br><code>[<?php echo esc_html($shortcode['name']); ?>]<?php _e('contenido', 'custom-shortcodes'); ?>[/<?php echo esc_html($shortcode['name']); ?>]</code>
+                        <?php endif; ?>
+                    </td>
+                    <td><?php echo esc_html($shortcode['description']); ?></td>
+                    <td>
+                        <?php echo date_i18n(get_option('date_format'), strtotime($shortcode['created'])); ?>
+                        <?php if (!empty($shortcode['updated'])): ?>
+                        <br><small><?php _e('Editado:', 'custom-shortcodes'); ?> <?php echo date_i18n(get_option('date_format'), strtotime($shortcode['updated'])); ?></small>
+                        <?php endif; ?>
+                    </td>
+                    <td>
+                        <a href="<?php echo admin_url('admin.php?page=add-custom-shortcode&edit=' . $shortcode['name']); ?>" class="button">
+                            <?php _e('Editar', 'custom-shortcodes'); ?>
+                        </a>
+                        <a href="<?php echo wp_nonce_url(admin_url('admin.php?page=custom-shortcodes&delete_shortcode=' . $shortcode['name']), 'delete_shortcode'); ?>" 
+                           class="button button-link-delete" 
+                           onclick="return confirm('<?php _e('¿Estás seguro de que quieres eliminar este shortcode?', 'custom-shortcodes'); ?>')">
+                            <?php _e('Eliminar', 'custom-shortcodes'); ?>
+                        </a>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        
+        <div style="margin-top: 20px;">
+            <a href="<?php echo admin_url('admin.php?page=add-custom-shortcode'); ?>" class="button button-primary">
+                <?php _e('Añadir Nuevo Shortcode', 'custom-shortcodes'); ?>
+            </a>
+            <a href="<?php echo admin_url('admin.php?page=shortcodes-email-settings'); ?>" class="button">
+                <?php _e('Configuración Emails', 'custom-shortcodes'); ?>
+            </a>
+            <a href="<?php echo admin_url('admin.php?page=shortcodes-documentation'); ?>" class="button">
+                <?php _e('Ver Documentación', 'custom-shortcodes'); ?>
+            </a>
+        </div>
+        <?php
+    }
+}
+
+// Inicializar el plugin
+new CustomShortcodesManager();
+
+// Funciones helper para uso directo en temas
+if (!function_exists('get_custom_shortcode')) {
+    function get_custom_shortcode($name, $atts = array(), $content = null) {
+        $shortcodes = get_option('csm_custom_shortcodes', array());
+        
+        foreach ($shortcodes as $shortcode) {
+            if ($shortcode['name'] === $name) {
+                $csm = new CustomShortcodesManager();
+                return $csm->render_shortcode($shortcode, $atts, $content);
+            }
+        }
+        
+        return '';
+    }
+}
+
+if (!function_exists('display_custom_field')) {
+    function display_custom_field($key, $post_id = null, $default = '') {
+        if (!$post_id) {
+            $post_id = get_the_ID();
+        }
+        
+        $value = get_post_meta($post_id, $key, true);
+        return empty($value) ? $default : $value;
+    }
+}
+?>
